@@ -157,6 +157,11 @@ with st.sidebar:
 
     delay = st.slider("Delay between requests (s)", 0.0, 5.0, 0.5, 0.1)
     batch_size = st.select_slider("Batch size", options=[5, 10, 25, 50, 100], value=10)
+    use_playwright = st.toggle(
+        "JS rendering (Playwright)",
+        value=False,
+        help="Enable for JS-heavy sites like Screwfix. Slower but extracts full page content. Auto-fallback is always on for sites returning <50 words."
+    )
 
     st.divider()
 
@@ -173,6 +178,7 @@ with st.sidebar:
                 st.session_state.crawl_end = crawl_end
                 st.session_state.delay = delay
                 st.session_state.batch_size = batch_size
+                st.session_state.use_playwright = use_playwright
                 st.session_state.status = 'running'
                 st.rerun()
         elif status == 'paused':
@@ -231,11 +237,12 @@ if st.session_state.status == 'running':
     end_idx = st.session_state.crawl_end
     batch = st.session_state.batch_size
     wait = st.session_state.delay
+    pw = st.session_state.get('use_playwright', False)
     processed = 0
 
     while st.session_state.current_index < end_idx and processed < batch:
         url = st.session_state.urls[st.session_state.current_index]
-        result = scrape_url(url)
+        result = scrape_url(url, use_playwright=pw)
         st.session_state.results.append([
             result['url'],
             result['status_code'],
