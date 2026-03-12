@@ -82,7 +82,7 @@ with st.sidebar:
 
     # Input
     st.subheader("1. Load URLs")
-    input_method = st.radio("Source", ["Upload CSV", "Google Sheet URL"], horizontal=True)
+    input_method = st.radio("Source", ["Upload CSV", "Google Sheet URL", "Enter Manually"], horizontal=False)
 
     if input_method == "Upload CSV":
         uploaded = st.file_uploader("CSV file (URLs in column A)", type=["csv"])
@@ -92,7 +92,8 @@ with st.sidebar:
                 if urls:
                     set_urls(urls)
                     st.success(f"Loaded {len(urls):,} URLs")
-    else:
+
+    elif input_method == "Google Sheet URL":
         gsheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
         st.caption("Sheet must be shared: *Anyone with the link can view*")
         if st.button("Load Sheet", use_container_width=True):
@@ -101,6 +102,35 @@ with st.sidebar:
                 if urls:
                     set_urls(urls)
                     st.success(f"Loaded {len(urls):,} URLs")
+
+    else:
+        manual_input = st.text_area(
+            "Paste URLs — one per line or copied direct from Google Sheets",
+            placeholder="https://example.com\nhttps://another-site.co.uk\nhttps://third-site.com\n...",
+            height=250
+        )
+
+        # Live count as user pastes
+        if manual_input:
+            preview_urls = []
+            for line in manual_input.splitlines():
+                # Take first cell only if pasted from multi-column sheet (tab separated)
+                cell = line.split('\t')[0].strip()
+                if cell:
+                    preview_urls.append(cell)
+            st.caption(f"{len(preview_urls):,} URLs detected")
+
+        if st.button("Load URLs", use_container_width=True):
+            urls = []
+            for line in manual_input.splitlines():
+                cell = line.split('\t')[0].strip()
+                if cell:
+                    urls.append(cell)
+            if urls:
+                set_urls(urls)
+                st.success(f"Loaded {len(urls):,} URLs")
+            else:
+                st.warning("No URLs found — paste one URL per line.")
 
     total = len(st.session_state.urls)
 
