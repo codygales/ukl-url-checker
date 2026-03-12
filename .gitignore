@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# Data — don't commit client URL lists or results
+*.csv
+*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
