@@ -3,6 +3,7 @@ import pandas as pd
 import time
 import re
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests as req
 
 from scraper import scrape_url
@@ -18,8 +19,9 @@ def init():
         'status': 'idle',       # idle | running | paused | stopped | done
         'current_index': 0,
         'crawl_end': 0,
-        'delay': 0.5,
-        'batch_size': 10,
+        'delay': 0.0,
+        'batch_size': 100,
+        'workers': 10,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -155,8 +157,12 @@ with st.sidebar:
         with c2:
             crawl_end = st.number_input("To", min_value=1, max_value=max(total, 1), value=min(500, max(total, 1)), step=1)
 
-    delay = st.slider("Delay between requests (s)", 0.0, 5.0, 0.5, 0.1)
-    batch_size = st.select_slider("Batch size", options=[5, 10, 25, 50, 100], value=10)
+    workers = st.select_slider("Concurrent workers", options=[1, 5, 10, 20, 25, 50], value=10,
+        help="How many URLs to check simultaneously. 10-25 is a good balance for large lists.")
+    batch_size = st.select_slider("Batch size", options=[25, 50, 100, 250, 500], value=100,
+        help="URLs processed per UI refresh. Higher = faster, less frequent progress updates.")
+    delay = st.slider("Delay between batches (s)", 0.0, 5.0, 0.0, 0.1,
+        help="With concurrent workers, delay between requests is less important. Keep at 0 for speed.")
     use_playwright = st.toggle(
         "JS rendering (Playwright)",
         value=False,
@@ -178,6 +184,7 @@ with st.sidebar:
                 st.session_state.crawl_end = crawl_end
                 st.session_state.delay = delay
                 st.session_state.batch_size = batch_size
+                st.session_state.workers = workers
                 st.session_state.use_playwright = use_playwright
                 st.session_state.status = 'running'
                 st.rerun()
@@ -238,21 +245,35 @@ if st.session_state.status == 'running':
     batch = st.session_state.batch_size
     wait = st.session_state.delay
     pw = st.session_state.get('use_playwright', False)
-    processed = 0
+    max_workers = st.session_state.get('workers', 10)
 
-    while st.session_state.current_index < end_idx and processed < batch:
-        url = st.session_state.urls[st.session_state.current_index]
-        result = scrape_url(url, use_playwright=pw)
-        st.session_state.results.append([
-            result['url'],
-            result['status_code'],
-            result['word_count'],
-            result['extract'],
-        ])
-        st.session_state.current_index += 1
-        processed += 1
-        if wait > 0:
-            time.sleep(wait)
+    # Grab next batch of URLs
+    start = st.session_state.current_index
+    end = min(start + batch, end_idx)
+    batch_urls = st.session_state.urls[start:end]
+
+    # Fetch concurrently
+    batch_results = [None] * len(batch_urls)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(scrape_url, url, 10, pw): i
+            for i, url in enumerate(batch_urls)
+        }
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            result = future.result()
+            batch_results[i] = [
+                result['url'],
+                result['status_code'],
+                result['word_count'],
+                result['extract'],
+            ]
+
+    st.session_state.results.extend(batch_results)
+    st.session_state.current_index = end
+
+    if wait > 0:
+        time.sleep(wait)
 
     if st.session_state.current_index >= end_idx:
         st.session_state.status = 'done'
