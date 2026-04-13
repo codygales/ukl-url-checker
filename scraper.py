@@ -53,6 +53,38 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _filtered_lines(element) -> str:
+    """
+    Extract and filter text lines from a BeautifulSoup element.
+    Returns clean prose as a single string.
+    """
+    raw = element.get_text(separator='\n', strip=True)
+    lines = []
+    for line in raw.splitlines():
+        line = clean_text(re.sub(r'\s+', ' ', line).strip())
+        words = line.split()
+        if len(words) < 2:
+            continue
+        if line.count('|') >= 2:
+            continue
+        if re.search(r'[»›»>]\s', line):
+            continue
+        alpha_ratio = sum(c.isalpha() for c in line) / max(len(line), 1)
+        if alpha_ratio < 0.55:
+            continue
+        lines.append(line)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for line in lines:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(line)
+
+    return ' '.join(unique)
+
+
 def extract_text(html: str | bytes) -> tuple[int, str]:
     """
     Parse HTML and return (word_count, clean_extract).
@@ -60,21 +92,34 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
     Accepts bytes (preferred — lets lxml auto-detect encoding from the
     <meta charset> declaration) or an already-decoded string.
 
-    Strategy:
-    1. Strip all known noise tags
-    2. Remove common noisy elements by class/id patterns (cookie banners, nav, etc.)
-    3. Target the main content area first before falling back to full body
-    4. Filter out short / nav-like text fragments from the result
+    Three-tier extraction strategy so something meaningful always comes through:
+
+    1. Primary — filtered prose lines from the main content container
+    2. Fallback — H1/H2/H3 headings + <p> paragraphs directly (catches sites
+       where the content container selector doesn't match)
+    3. Last resort — page <title> + meta description (always present, better
+       than returning nothing)
     """
     soup = BeautifulSoup(html, 'lxml')
 
-    # Remove noise tags entirely
+    # Grab title and meta description before we start stripping (they're in
+    # <head> so won't be removed, but grabbing early is safer).
+    page_title = ''
+    title_tag = soup.find('title')
+    if title_tag:
+        page_title = clean_text(title_tag.get_text(strip=True))
+
+    meta_desc = ''
+    meta_tag = soup.find('meta', attrs={'name': re.compile(r'^description$', re.I)})
+    if meta_tag:
+        meta_desc = clean_text((meta_tag.get('content') or '').strip())
+
+    # ── Strip noise tags ────────────────────────────────────────────────────
     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside',
                      'noscript', 'iframe', 'form', 'svg', 'figure', 'picture',
                      'button', 'select', 'input', 'textarea']):
         tag.decompose()
 
-    # Remove common noise elements by class or id pattern
     noise_re = re.compile(
         r'cookie|consent|gdpr|banner|popup|modal|overlay|notification|alert|'
         r'chat|widget|breadcrumb|pagination|social|share|related|comment|'
@@ -89,7 +134,7 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
         if noise_re.search(classes) or noise_re.search(el_id):
             el.decompose()
 
-    # Find the most relevant content container
+    # ── Tier 1: primary content container ──────────────────────────────────
     content = (
         soup.find('main') or
         soup.find(attrs={'role': 'main'}) or
@@ -102,43 +147,38 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
         soup.body or
         soup
     )
-
-    # Get text as newline-separated lines and filter for quality
-    raw = content.get_text(separator='\n', strip=True)
-
-    lines = []
-    for line in raw.splitlines():
-        line = clean_text(re.sub(r'\s+', ' ', line).strip())
-        words = line.split()
-
-        # Skip single-word fragments (labels, lone buttons)
-        if len(words) < 2:
-            continue
-        # Skip pipe-separated navigation strings
-        if line.count('|') >= 2:
-            continue
-        # Skip breadcrumb-style lines
-        if re.search(r'[»›»>]\s', line):
-            continue
-        # Skip lines that are mostly numbers/special characters (junk encoding artefacts)
-        alpha_ratio = sum(c.isalpha() for c in line) / max(len(line), 1)
-        if alpha_ratio < 0.55:
-            continue
-
-        lines.append(line)
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for line in lines:
-        key = line.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(line)
-
-    full_text = ' '.join(unique)
+    full_text = _filtered_lines(content)
     word_count = len(full_text.split())
-    extract = full_text[:700] if len(full_text) > 700 else full_text
+    extract = full_text[:700]
+
+    # ── Tier 2: headings + paragraphs ──────────────────────────────────────
+    # Used when the content container yielded sparse results (< 20 words).
+    # Directly targets semantic tags across the whole body so it doesn't
+    # depend on a specific wrapper class or id being present.
+    if word_count < 20:
+        parts = []
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'p']):
+            t = clean_text(tag.get_text(separator=' ', strip=True))
+            if t and len(t.split()) >= 2:
+                parts.append(t)
+        seen: set[str] = set()
+        unique = [p for p in parts if not (p.lower() in seen or seen.add(p.lower()))]  # type: ignore[func-returns-value]
+        fallback_text = ' '.join(unique)
+        fallback_wc = len(fallback_text.split())
+        if fallback_wc > word_count:
+            word_count = fallback_wc
+            extract = fallback_text[:700]
+
+    # ── Tier 3: meta description + title ───────────────────────────────────
+    # Last resort when the page has no extractable body text at all
+    # (e.g. fully JS-rendered, Playwright hasn't fired yet).
+    if word_count < 5:
+        meta_text = ' — '.join(filter(None, [page_title, meta_desc]))
+        meta_wc = len(meta_text.split())
+        if meta_wc > word_count:
+            word_count = meta_wc
+            extract = meta_text[:700]
+
     return word_count, extract
 
 
