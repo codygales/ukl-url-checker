@@ -111,8 +111,8 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
         line = clean_text(re.sub(r'\s+', ' ', line).strip())
         words = line.split()
 
-        # Skip short fragments (likely labels, nav items, or single words)
-        if len(words) < 4:
+        # Skip single-word fragments (labels, lone buttons)
+        if len(words) < 2:
             continue
         # Skip pipe-separated navigation strings
         if line.count('|') >= 2:
@@ -122,7 +122,7 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
             continue
         # Skip lines that are mostly numbers/special characters (junk encoding artefacts)
         alpha_ratio = sum(c.isalpha() for c in line) / max(len(line), 1)
-        if alpha_ratio < 0.6:
+        if alpha_ratio < 0.55:
             continue
 
         lines.append(line)
@@ -142,24 +142,18 @@ def extract_text(html: str | bytes) -> tuple[int, str]:
     return word_count, extract
 
 
-def _redirect_domain(original_url: str, final_url: str) -> str:
-    """
-    Return the final domain if the redirect landed on a different domain,
-    otherwise return an empty string.
-    """
-    orig = urlparse(original_url).netloc.lower().removeprefix('www.')
-    final = urlparse(final_url).netloc.lower().removeprefix('www.')
-    if final and orig != final:
-        return urlparse(final_url).netloc.lower()
-    return ''
-
-
 def scrape_with_requests(url: str, timeout: int = 10) -> dict:
     """
     Standard requests-based fetch.
     Rotates user agents with short back-off on bot-blocking status codes.
     Uses response.content (bytes) so lxml can auto-detect page encoding,
     which avoids garbled text from mis-declared charsets.
+
+    Redirect handling: allow_redirects=True follows the chain automatically.
+    If any redirect occurred we report the INITIAL status code (301/302) and
+    store the final destination URL in redirected_to.  Text is still extracted
+    from the final page so word_count/extract are always populated for live
+    destinations.
     """
     session = requests.Session()
 
@@ -168,59 +162,70 @@ def scrape_with_requests(url: str, timeout: int = 10) -> dict:
         session.headers.update({**HEADERS, 'User-Agent': ua})
         try:
             response = session.get(url, timeout=timeout, allow_redirects=True)
-            status = response.status_code
-            last_status = status
-            final_url = response.url
-            redir = _redirect_domain(url, final_url)
+            final_status = response.status_code
+            final_url = str(response.url)
 
-            if status == 200:
-                # Use .content (bytes) — lxml reads the charset declaration
-                # directly, which prevents symbol garbage from encoding mismatches.
+            # If there were any redirects, report the first redirect code
+            # and record where the URL ended up.
+            if response.history:
+                reported_status = response.history[0].status_code
+                redirected_to = final_url
+            else:
+                reported_status = final_status
+                redirected_to = ''
+
+            last_status = reported_status
+
+            # Bot-blocking check uses the FINAL status (the page we actually landed on)
+            if final_status in BOT_BLOCK_CODES and attempt < len(USER_AGENTS) - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+
+            # Extract text whenever the final destination returned 200
+            if final_status == 200:
                 word_count, extract = extract_text(response.content)
                 return {
                     'url': url,
-                    'status_code': status,
-                    'redirect_domain': redir,
+                    'status_code': reported_status,
+                    'redirected_to': redirected_to,
                     'word_count': word_count,
                     'extract': extract,
                     'js_rendered': False,
                     'verified': True,
+                    '_final_status': final_status,
                 }
 
-            if status in BOT_BLOCK_CODES and attempt < len(USER_AGENTS) - 1:
-                # Back off before trying next UA
-                time.sleep(0.5 * (attempt + 1))
-                continue
-
-            # Non-blocking error (404, 410, 301, etc.) — return immediately
+            # All other outcomes (404, 410, final bot-block after all UAs, etc.)
             return {
                 'url': url,
-                'status_code': status,
-                'redirect_domain': redir,
+                'status_code': reported_status,
+                'redirected_to': redirected_to,
                 'word_count': 0,
                 'extract': '',
                 'js_rendered': False,
                 'verified': False,
+                '_final_status': final_status,
             }
 
         except requests.exceptions.Timeout:
-            return {'url': url, 'status_code': 'TIMEOUT', 'redirect_domain': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False}
+            return {'url': url, 'status_code': 'TIMEOUT', 'redirected_to': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False, '_final_status': 'TIMEOUT'}
         except requests.exceptions.ConnectionError:
-            return {'url': url, 'status_code': 'CONNECTION_ERROR', 'redirect_domain': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False}
+            return {'url': url, 'status_code': 'CONNECTION_ERROR', 'redirected_to': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False, '_final_status': 'CONNECTION_ERROR'}
         except requests.exceptions.TooManyRedirects:
-            return {'url': url, 'status_code': 'TOO_MANY_REDIRECTS', 'redirect_domain': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False}
+            return {'url': url, 'status_code': 'TOO_MANY_REDIRECTS', 'redirected_to': '', 'word_count': 0, 'extract': '', 'js_rendered': False, 'verified': False, '_final_status': 'TOO_MANY_REDIRECTS'}
         except Exception as e:
-            return {'url': url, 'status_code': 'ERROR', 'redirect_domain': '', 'word_count': 0, 'extract': str(e)[:120], 'js_rendered': False, 'verified': False}
+            return {'url': url, 'status_code': 'ERROR', 'redirected_to': '', 'word_count': 0, 'extract': str(e)[:120], 'js_rendered': False, 'verified': False, '_final_status': 'ERROR'}
 
     # All UAs exhausted and still blocked
     return {
         'url': url,
         'status_code': last_status or 'BLOCKED',
-        'redirect_domain': '',
+        'redirected_to': '',
         'word_count': 0,
         'extract': '',
         'js_rendered': False,
         'verified': False,
+        '_final_status': last_status or 'BLOCKED',
     }
 
 
@@ -283,7 +288,7 @@ def scrape_with_playwright(url: str, timeout: int = 20) -> dict | None:
                 page.goto(url, timeout=timeout * 1000, wait_until='domcontentloaded')
             except PWTimeout:
                 browser.close()
-                return {'url': url, 'status_code': 'TIMEOUT', 'redirect_domain': '', 'word_count': 0, 'extract': '', 'js_rendered': True, 'verified': False}
+                return {'url': url, 'status_code': 'TIMEOUT', 'redirected_to': '', 'word_count': 0, 'extract': '', 'js_rendered': True, 'verified': False, '_final_status': 'TIMEOUT'}
 
             # Wait for content to settle + trigger lazy-loaded elements
             page.wait_for_timeout(1500)
@@ -293,60 +298,63 @@ def scrape_with_playwright(url: str, timeout: int = 20) -> dict | None:
             html = page.content()
             final_url = page.url
             actual_status = status_holder['code'] or 200
-            redir = _redirect_domain(url, final_url)
+            # Record redirect destination if the browser ended up on a different URL
+            redirected_to = final_url if final_url.rstrip('/') != url.rstrip('/') else ''
             browser.close()
 
         word_count, extract = extract_text(html)
         return {
             'url': url,
             'status_code': actual_status,
-            'redirect_domain': redir,
+            'redirected_to': redirected_to,
             'word_count': word_count,
             'extract': extract,
             'js_rendered': True,
             'verified': True,
+            '_final_status': actual_status,
         }
 
     except Exception as e:
         return {
             'url': url,
             'status_code': 'PLAYWRIGHT_ERROR',
-            'redirect_domain': '',
+            'redirected_to': '',
             'word_count': 0,
             'extract': str(e)[:120],
             'js_rendered': True,
             'verified': False,
+            '_final_status': 'PLAYWRIGHT_ERROR',
         }
 
 
 def classify(status_code, word_count: int) -> str:
-    """Plain-English classification of a URL result."""
+    """
+    Five plain-English categories:
+
+    LIVE     — 200 with readable text (use Extract to spot for-sale pages)
+    PARKED   — 200 but no extractable text (JS-only or true parking page)
+    REDIRECT — 3xx redirect (check Redirected To column for destination)
+    DEAD     — 404, 410, connection failures, redirect loops
+    BLOCKED  — bot-blocking 4xx (403, 429, 503 etc.) after all retries
+    ERROR    — 5xx server errors, timeouts, or unexpected failures
+    """
     if isinstance(status_code, int):
         if status_code == 200:
-            if word_count >= 150:
-                return 'LIVE'
-            elif word_count >= 30:
-                return 'THIN'
-            else:
-                return 'PARKED'
+            return 'LIVE' if word_count > 0 else 'PARKED'
         if status_code in (301, 302, 307, 308):
             return 'REDIRECT'
         if status_code in (404, 410):
-            return 'NOT FOUND'
+            return 'DEAD'
         if status_code in BOT_BLOCK_CODES:
             return 'BLOCKED'
         if status_code >= 500:
-            return 'SERVER ERROR'
-        return f'HTTP {status_code}'
+            return 'ERROR'
+        return 'DEAD'
 
     code_str = str(status_code)
-    if code_str == 'TIMEOUT':
-        return 'TIMEOUT'
-    if code_str == 'CONNECTION_ERROR':
-        return 'DOWN'
-    if code_str in ('TOO_MANY_REDIRECTS',):
-        return 'REDIRECT LOOP'
-    return 'ERROR'
+    if code_str in ('CONNECTION_ERROR', 'TOO_MANY_REDIRECTS'):
+        return 'DEAD'
+    return 'ERROR'  # TIMEOUT, PLAYWRIGHT_ERROR, etc.
 
 
 def scrape_url(url: str, timeout: int = 10, use_playwright: bool = False) -> dict:
@@ -373,32 +381,37 @@ def scrape_url(url: str, timeout: int = 10, use_playwright: bool = False) -> dic
     # Fast path: requests
     result = scrape_with_requests(url, timeout)
 
+    # Use the actual final HTTP status for verification logic, not the
+    # reported status (which may be a 301/302 if a redirect occurred).
+    final_status = result.get('_final_status', result['status_code'])
+
     # Determine if Playwright should verify the result.
     # Covers:
-    #   - Known bot-blocking codes (403, 429, 503, 406, 999)
-    #   - Any other 4xx that isn't a definitive not-found (404, 410) —
-    #     e.g. 401, 406, 451 can all be bot-triggered on live sites
-    #   - 200 responses with suspiciously low word counts (parked / JS-only pages)
-    status = result['status_code']
+    #   - Any 4xx that isn't a definitive not-found (404, 410) —
+    #     e.g. 401, 403, 406, 429, 451, 503 can all be bot-triggered on live sites
+    #   - Direct 200s (no redirect) with low word counts — likely JS-rendered pages
     is_ambiguous_4xx = (
-        isinstance(status, int) and
-        400 <= status < 500 and
-        status not in (404, 410)
+        isinstance(final_status, int) and
+        400 <= final_status < 500 and
+        final_status not in (404, 410)
     )
-    needs_verification = (
-        is_ambiguous_4xx or
-        (status == 200 and result['word_count'] < 50)
+    # Only trigger Playwright for thin content on direct 200s (not redirects —
+    # the text was extracted from the redirect destination which is already a real page)
+    is_thin_direct = (
+        final_status == 200 and
+        result['word_count'] < 100 and
+        not result.get('redirected_to')
     )
+    needs_verification = is_ambiguous_4xx or is_thin_direct
 
     if needs_verification:
         pw_result = scrape_with_playwright(url, timeout + 10)
         if pw_result:
-            # Prefer Playwright if it gets a real 200 with more content,
-            # or if requests was blocked and Playwright got through at all.
+            pw_final = pw_result.get('_final_status', pw_result['status_code'])
             if (
-                pw_result['status_code'] == 200 and pw_result['word_count'] > result['word_count']
+                pw_final == 200 and pw_result['word_count'] > result['word_count']
             ) or (
-                is_ambiguous_4xx and pw_result['status_code'] == 200
+                is_ambiguous_4xx and pw_final == 200
             ):
                 pw_result['classification'] = classify(pw_result['status_code'], pw_result['word_count'])
                 return pw_result

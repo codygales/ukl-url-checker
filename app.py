@@ -60,7 +60,7 @@ def load_gsheet(url: str) -> list:
         st.error(f"Could not load Google Sheet: {e}. Make sure sharing is set to 'Anyone with the link can view'.")
         return []
 
-COLUMNS = ['URL', 'Status Code', 'Classification', 'Redirect Domain', 'Word Count', 'JS Rendered', 'Extract']
+COLUMNS = ['URL', 'Status Code', 'Classification', 'Redirected To', 'Word Count', 'JS Rendered', 'Extract']
 
 def results_to_df() -> pd.DataFrame:
     if not st.session_state.results:
@@ -250,7 +250,7 @@ if st.session_state.status == 'running':
                 result['url'],
                 result['status_code'],
                 result.get('classification', ''),
-                result.get('redirect_domain', ''),
+                result.get('redirected_to', ''),
                 result['word_count'],
                 result.get('js_rendered', False),
                 result['extract'],
@@ -278,7 +278,7 @@ if st.session_state.results:
     # Export
     col1, col2 = st.columns([1, 6])
     with col1:
-        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        csv_bytes = df.to_csv(index=False).encode('utf-8-sig')  # BOM ensures Excel opens with correct encoding
         st.download_button("Export CSV", csv_bytes, "ukl_url_check.csv", "text/csv", use_container_width=True)
 
     # Summary by classification (most useful view)
@@ -311,7 +311,7 @@ if st.session_state.results:
             'URL': st.column_config.LinkColumn('URL', width='medium'),
             'Status Code': st.column_config.TextColumn('Status', width='small'),
             'Classification': st.column_config.TextColumn('Classification', width='small'),
-            'Redirect Domain': st.column_config.TextColumn('Redirect Domain', width='medium'),
+            'Redirected To': st.column_config.LinkColumn('Redirected To', width='medium'),
             'Word Count': st.column_config.NumberColumn('Words', width='small'),
             'JS Rendered': st.column_config.CheckboxColumn('JS', width='small'),
             'Extract': st.column_config.TextColumn('Page Extract', width='large'),
